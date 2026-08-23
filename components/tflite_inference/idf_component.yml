@@ -1,0 +1,6 @@
+## Real, confirmed component from Espressif's registry — verified
+## before use (not guessed), the same discipline that caught a wrong
+## version number for the temperature sensor's library earlier in this
+## project. Current published version at time of writing: 1.3.3.
+dependencies:
+  espressif/esp-tflite-micro: "^1.3.0"

@@ -1,0 +1,63 @@
+dependencies:
+  espressif/ds18b20:
+    component_hash: 38022d0c39c08b1df3e77f95a3f9544251549a1fd9b6263357bf714026f4bb6b
+    dependencies:
+    - name: espressif/onewire_bus
+      registry_url: https://components.espressif.com
+      require: private
+      version: ^1.1.0
+    - matches:
+      - if: $CONFIG{DS18B20_SENSOR_HUB} == True
+      name: espressif/sensor_hub
+      registry_url: https://components.espressif.com
+      require: public
+      version: ^0.1.4
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.4.0
+  espressif/esp-nn:
+    component_hash: a039fa2814bff411d33e7b8fe6a1127a7eac345385761139da0f0fc88cc9d7b8
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.2'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.2.6
+  espressif/esp-tflite-micro:
+    component_hash: 1ce00c44af2362d48b5c0eefc5fcc60fa54d84db332c80005ae324556f4df0db
+    dependencies:
+    - name: espressif/esp-nn
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=1.1.1'
+    - name: idf
+      require: private
+      version: '>=5.1'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.4.0
+  espressif/onewire_bus:
+    component_hash: a85dc1ceb71fb87af77c57d5fd4e6f48a504de1fc2b83fc302ec0cea331d05ce
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.1.1
+  idf:
+    source:
+      type: idf
+    version: 5.5.5
+direct_dependencies:
+- espressif/ds18b20
+- espressif/esp-tflite-micro
+- espressif/onewire_bus
+manifest_hash: c006f88222351dce5f6e4a6795c9144536480ab7526e730dfda7de24ef0e4b9a
+target: esp32s3
+version: 2.0.0

@@ -1,0 +1,254 @@
+#include "max30102_driver.h"
+
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_log.h"
+#include "i2c_bus.h"
+
+static const char *TAG = "max30102_driver";
+
+// 7-bit I2C address, locked in circuit_design_handoff.md and confirmed
+// against the real board in hardware_bringup_handoff.md (I2C bus scan).
+#define MAX30102_I2C_ADDR 0x57
+
+// --- Register addresses, per the MAX30102 datasheet. ---
+#define REG_INTR_ENABLE_1   0x02
+#define REG_INTR_ENABLE_2   0x03
+#define REG_FIFO_WR_PTR     0x04
+#define REG_OVF_COUNTER     0x05
+#define REG_FIFO_RD_PTR     0x06
+#define REG_FIFO_DATA       0x07
+#define REG_FIFO_CONFIG     0x08
+#define REG_MODE_CONFIG     0x09
+#define REG_SPO2_CONFIG     0x0A
+#define REG_LED1_PA         0x0C  // Red LED current
+#define REG_LED2_PA         0x0D  // IR LED current
+#define REG_PART_ID         0xFF
+
+#define EXPECTED_PART_ID    0x15
+
+// --- Mode/config values. ---
+// MODE_CONFIG = 0x03: SpO2 mode. This turns on BOTH Red and IR LEDs and
+// writes both into the FIFO as a pair per sample. There is no "IR only"
+// hardware mode on this chip, so both channels are always captured
+// together; this driver simply only exposes the IR one, per the
+// correction noted in the header file.
+#define MODE_CONFIG_SPO2    0x03
+
+// SPO2_CONFIG: ADC range = 01 (4096nA, good default for wrist use),
+// sample rate = 001 (100 samples/sec, matching the 100Hz firmware
+// acquisition rate specified in chat2_firmware_handoff.md), pulse width
+// = 11 (411us, giving the full 18-bit ADC resolution).
+// Bits: [6:5]=ADC_RGE [4:2]=SR [1:0]=PW  ->  01 001 11 = 0b01001111
+#define SPO2_CONFIG_VALUE   0b01001111
+
+// FIFO_CONFIG: sample averaging = 010 (4-sample average, smooths noise
+// without costing too much responsiveness), rollover disabled, almost-
+// full threshold left at default (not used by this polling driver).
+#define FIFO_CONFIG_VALUE   0b01000000
+
+// LED current. 0x24 gives roughly 7.4mA, a commonly-used starting point
+// for wrist-worn PPG. TODO: this is a starting value, not yet tuned
+// against a real captured waveform — revisit once we can see actual
+// signal quality on this board, the same way the EDA circuit's values
+// were refined during hardware bring-up.
+#define LED_CURRENT_VALUE   0x24
+
+#define RING_BUFFER_SIZE 400  // 4 seconds of samples at 100Hz
+
+static i2c_master_dev_handle_t s_dev_handle = NULL;
+
+static SemaphoreHandle_t s_buffer_mutex = NULL;
+static uint32_t s_ring_buffer[RING_BUFFER_SIZE];
+static size_t s_ring_head = 0;   // next write position
+static size_t s_ring_count = 0;  // how many valid samples are queued
+static uint32_t s_last_ir_sample = 0;
+static bool s_have_sample = false;
+
+// --- Small I2C helpers. Every other function in this file goes through
+//     these two, so the actual bus communication only needs to be
+//     gotten right in one place. ---
+
+static esp_err_t write_register(uint8_t reg, uint8_t value)
+{
+    uint8_t buf[2] = { reg, value };
+    return i2c_master_transmit(s_dev_handle, buf, sizeof(buf), 100 /* ms timeout */);
+}
+
+static esp_err_t read_registers(uint8_t start_reg, uint8_t *out_buf, size_t len)
+{
+    return i2c_master_transmit_receive(s_dev_handle, &start_reg, 1, out_buf, len, 100 /* ms timeout */);
+}
+
+static void push_sample(uint32_t ir_value)
+{
+    xSemaphoreTake(s_buffer_mutex, portMAX_DELAY);
+    s_ring_buffer[s_ring_head] = ir_value;
+    s_ring_head = (s_ring_head + 1) % RING_BUFFER_SIZE;
+    if (s_ring_count < RING_BUFFER_SIZE) {
+        s_ring_count++;
+    } else {
+        // Buffer is full and nobody has been draining it. Oldest sample
+        // just got silently overwritten. Log this — it means whatever
+        // is supposed to be calling max30102_read_ir_samples() isn't
+        // keeping up.
+        ESP_LOGW(TAG, "Sample buffer full — oldest unread sample was overwritten");
+    }
+    s_last_ir_sample = ir_value;
+    s_have_sample = true;
+    xSemaphoreGive(s_buffer_mutex);
+}
+
+// --- Background task: drains the sensor's FIFO into our own buffer. ---
+//
+// PLAIN-LANGUAGE SUMMARY OF THIS LOOP:
+// The sensor fills its own small internal memory at a steady 100
+// readings per second, entirely on its own, in hardware. This task
+// checks every 50ms how many new readings have piled up (by comparing
+// the sensor's own write and read pointers) and pulls all of them out
+// in one go, storing just the IR value from each into our buffer.
+static void max30102_reading_task(void *arg)
+{
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        uint8_t wr_ptr = 0, rd_ptr = 0;
+        esp_err_t wr_err = read_registers(REG_FIFO_WR_PTR, &wr_ptr, 1);
+        if (wr_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to read FIFO write pointer: %s", esp_err_to_name(wr_err));
+            continue;
+        }
+        esp_err_t rd_err = read_registers(REG_FIFO_RD_PTR, &rd_ptr, 1);
+        if (rd_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to read FIFO read pointer: %s", esp_err_to_name(rd_err));
+            continue;
+        }
+
+        // The FIFO is a 32-slot ring buffer on the sensor itself. This
+        // arithmetic figures out how many new, unread samples are
+        // sitting in it right now.
+        int num_available = (int)wr_ptr - (int)rd_ptr;
+        if (num_available < 0) {
+            num_available += 32;
+        }
+        if (num_available == 0) {
+            continue;
+        }
+
+        // Each sample is 6 bytes: 3 bytes Red, then 3 bytes IR. Reading
+        // FIFO_DATA repeatedly auto-advances the sensor's internal read
+        // pointer, one sample at a time.
+        for (int i = 0; i < num_available; i++) {
+            uint8_t sample_bytes[6] = {0};
+            if (read_registers(REG_FIFO_DATA, sample_bytes, sizeof(sample_bytes)) != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to read a FIFO sample");
+                break;
+            }
+
+            // Each channel is 18 bits, packed into 3 bytes with the top
+            // 6 bits unused — mask them off.
+            uint32_t ir_raw = ((uint32_t)sample_bytes[3] << 16) |
+                               ((uint32_t)sample_bytes[4] << 8) |
+                               (uint32_t)sample_bytes[5];
+            ir_raw &= 0x3FFFF;
+
+            push_sample(ir_raw);
+        }
+    }
+}
+
+esp_err_t max30102_driver_init(void)
+{
+    s_buffer_mutex = xSemaphoreCreateMutex();
+    if (s_buffer_mutex == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t err = i2c_bus_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    i2c_master_bus_handle_t bus = i2c_bus_get_handle();
+    i2c_device_config_t dev_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = MAX30102_I2C_ADDR,
+        .scl_speed_hz = 400000,  // 400kHz Fast Mode, per circuit_design_handoff.md
+    };
+    err = i2c_master_bus_add_device(bus, &dev_config, &s_dev_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add MAX30102 to the I2C bus: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // Confirm this is genuinely a MAX30102 before configuring it, the
+    // same "measure, don't assume" discipline used during hardware
+    // bring-up. If this fails or reads an unexpected value, wiring or
+    // the part itself is suspect.
+    uint8_t part_id = 0;
+    err = read_registers(REG_PART_ID, &part_id, 1);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read MAX30102 PART_ID register: %s", esp_err_to_name(err));
+        return err;
+    }
+    if (part_id != EXPECTED_PART_ID) {
+        ESP_LOGE(TAG, "Unexpected PART_ID: got 0x%02X, expected 0x%02X. "
+                       "Check wiring and I2C address.", part_id, EXPECTED_PART_ID);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    // Reset the FIFO pointers so we start from a known, empty state.
+    write_register(REG_FIFO_WR_PTR, 0x00);
+    write_register(REG_OVF_COUNTER, 0x00);
+    write_register(REG_FIFO_RD_PTR, 0x00);
+
+    write_register(REG_FIFO_CONFIG, FIFO_CONFIG_VALUE);
+    write_register(REG_MODE_CONFIG, MODE_CONFIG_SPO2);
+    write_register(REG_SPO2_CONFIG, SPO2_CONFIG_VALUE);
+    write_register(REG_LED1_PA, LED_CURRENT_VALUE);  // Red — captured but unused
+    write_register(REG_LED2_PA, LED_CURRENT_VALUE);  // IR — this is the one we read
+
+    BaseType_t ok = xTaskCreate(max30102_reading_task, "max30102_read", 3072, NULL, 5, NULL);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "Could not start the background reading task");
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG, "MAX30102 ready (PART_ID confirmed 0x%02X), SpO2 mode, 100Hz, IR channel active",
+              part_id);
+    return ESP_OK;
+}
+
+esp_err_t max30102_read_ir_samples(uint32_t *out_buf, size_t max_count, size_t *out_count)
+{
+    xSemaphoreTake(s_buffer_mutex, portMAX_DELAY);
+
+    size_t to_read = (s_ring_count < max_count) ? s_ring_count : max_count;
+    size_t read_start = (s_ring_head + RING_BUFFER_SIZE - s_ring_count) % RING_BUFFER_SIZE;
+
+    for (size_t i = 0; i < to_read; i++) {
+        out_buf[i] = s_ring_buffer[(read_start + i) % RING_BUFFER_SIZE];
+    }
+    s_ring_count -= to_read;
+
+    xSemaphoreGive(s_buffer_mutex);
+
+    *out_count = to_read;
+    return ESP_OK;
+}
+
+bool max30102_get_last_ir_sample(uint32_t *out_value)
+{
+    xSemaphoreTake(s_buffer_mutex, portMAX_DELAY);
+    bool have_sample = s_have_sample;
+    uint32_t value = s_last_ir_sample;
+    xSemaphoreGive(s_buffer_mutex);
+
+    if (!have_sample) {
+        return false;
+    }
+    *out_value = value;
+    return true;
+}

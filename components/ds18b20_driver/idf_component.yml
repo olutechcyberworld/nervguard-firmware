@@ -1,0 +1,10 @@
+## This file tells ESP-IDF's component manager to automatically download
+## two small, well-maintained libraries this driver relies on, instead
+## of writing the low-level 1-Wire protocol and DS18B20 command set from
+## scratch. This is the standard, current-recommended approach for this
+## sensor on ESP-IDF, and it works the same way whether ESP-IDF is being
+## driven directly or through PlatformIO's espidf framework, since
+## PlatformIO's espidf framework IS the real ESP-IDF build system.
+dependencies:
+  espressif/onewire_bus: "^1.0.0"
+  espressif/ds18b20: "^0.4.0"
