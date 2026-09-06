@@ -41,6 +41,15 @@ typedef struct {
     float acc_mag_mean;
     float acc_mag_std;
     float acc_activity;  // 1.0f if acc_mag_std > 0.02g, else 0.0f
+
+    // Firmware-internal only — deliberately placed AFTER the locked 13
+    // fields above and NOT included in feature_vector_to_array(), so it
+    // never reaches the BLE wire format or the model input. Fraction of
+    // this window's raw EDA samples that were extrapolated or noise-
+    // rejected; consumed only by ble_gatt_server.c's calibration
+    // validity check. See feature_extraction.c's feed_eda() for how
+    // this is computed.
+    float eda_reject_frac;
 } feature_vector_t;
 
 esp_err_t feature_extraction_init(void);

@@ -84,6 +84,22 @@ static bool s_sub_battery_level = false;
 // =====================================================================
 #define CALIBRATION_MIN_VALID_WINDOWS 24
 #define CALIBRATION_MAX_WINDOWS       36  // 3 minutes / 5s step
+
+// Not part of the original locked contract — added after real bench
+// testing showed extended stretches where the EDA front end's noise
+// filter was holding or extrapolating most samples in a tick, on this
+// project's unshielded breadboard build (see
+// firmware_phase3_session_handoff_writeup_data.md and eda_driver.h for
+// the underlying hardware cause). Nothing previously stopped a window
+// dominated by that noise from being folded into calibration statistics
+// as if it were a genuine resting-baseline sample. 0.5 is a first,
+// conservative cut, not a measured value: a window is excluded from
+// calibration once more than half its raw EDA samples across the
+// 60-second window were extrapolated or noise-rejected. Revisit this
+// threshold once the calibration table's known gaps (see eda_driver.h)
+// are filled in and/or the front end is shielded, since both should
+// reduce how often this fires in practice.
+#define CALIBRATION_MAX_EDA_REJECT_FRAC 0.5f
 static double s_cal_sum[13];
 static double s_cal_sum_sq[13];
 static int s_cal_valid_count = 0;
@@ -167,10 +183,14 @@ static void feed_calibration_window(const feature_vector_t *fv)
     feature_vector_to_array(fv, arr);
 
     // A valid window: all 13 features computed without NaN/sentinel
-    // substitution, AND acc_activity == 0 (per the locked contract).
+    // substitution, acc_activity == 0 (per the locked contract), AND
+    // (added after real testing surfaced the gap) not dominated by EDA
+    // front-end noise or extrapolation — see CALIBRATION_MAX_EDA_REJECT_FRAC
+    // above for why.
     bool valid = (fv->acc_activity == 0.0f) &&
                  (fv->hrv_rmssd != -1.0f) && (fv->hrv_mean_rr != -1.0f) &&
-                 (fv->hrv_sdnn != -1.0f) && (fv->hrv_sd2 != -1.0f);
+                 (fv->hrv_sdnn != -1.0f) && (fv->hrv_sd2 != -1.0f) &&
+                 (fv->eda_reject_frac <= CALIBRATION_MAX_EDA_REJECT_FRAC);
 
     if (valid) {
         for (int i = 0; i < 13; i++) {
@@ -347,6 +367,16 @@ void ble_gatt_server_update_wear_detection(float current_temp_c)
     } else if (s_state == STATE_NOT_WORN && current_temp_c > WEAR_RETURN_MONITOR_C) {
         set_state(STATE_MONITORING, 0);
     }
+}
+
+void ble_gatt_server_set_error(uint8_t error_code)
+{
+    // Deliberately unconditional: a sensor fault reported after boot
+    // (e.g. a later persistent-signal failure) must be able to override
+    // whatever state the device was already in, same as it would need
+    // to at boot. set_state() -> notify_device_state() already handles
+    // the "nobody connected yet" case safely (see notify_device_state()).
+    set_state(STATE_ERROR, error_code);
 }
 
 // =====================================================================

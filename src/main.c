@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdbool.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -34,7 +35,42 @@ static const char *TAG = "main";
  * hardware, before reaching this point — see each driver's own header
  * file for that history. This is the first time the whole chain runs
  * together, end to end.
+ *
+ * BOOT-SEQUENCING FIX (this revision): the previous version of this
+ * file initialised BLE last, after every sensor driver, and hard-halted
+ * app_main() on the FIRST subsystem that failed to start — including
+ * subsystems that have nothing to do with BLE. In practice this meant a
+ * single sensor fault (most recently, DS18B20 failing to enumerate on
+ * GPIO5) silently prevented the device from ever advertising at all,
+ * which looked from the phone app like a BLE discoverability bug when
+ * the BLE code itself was never actually reached, let alone at fault.
+ *
+ * This version inverts that: ble_gatt_server_init() now runs first,
+ * immediately after NVS, and is the ONLY subsystem whose failure still
+ * halts app_main() outright — because without it there is no way for
+ * the app, or anyone without a serial cable, to observe any subsequent
+ * failure. Every sensor and actuator driver after that point is
+ * initialised independently; a failure in any one of them is logged,
+ * reported to the app as an ERROR device state where the locked
+ * contract defines a matching code, and then app_main() continues past
+ * it rather than returning. Every per-tick use of a driver later in
+ * this file is now guarded by that driver's own "_ok" flag, since a
+ * driver that failed init must never be called into during the main
+ * loop.
  */
+
+// Per-subsystem init success, checked before every per-tick use of that
+// subsystem in the main loop below. false means "skip this subsystem
+// entirely, but keep running everything else."
+static bool s_ds18b20_ok = false;
+static bool s_max30102_ok = false;
+static bool s_mpu6500_ok = false;
+static bool s_eda_ok = false;
+static bool s_motor_ok = false;
+static bool s_led_ok = false;
+static bool s_feature_extraction_ok = false;
+static bool s_tflite_ok = false;
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "NervGuard firmware starting...");
@@ -65,69 +101,122 @@ void app_main(void)
         return;
     }
 
-    esp_err_t err = ds18b20_driver_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Temperature sensor failed to start. Halting here so the "
-                       "failure is obvious rather than silently continuing.");
-        return;
-    }
-    ds18b20_set_upsample_method(TEMP_UPSAMPLE_HOLD_LAST);  // locked, see ds18b20_driver.h
-
-    err = max30102_driver_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Heart rate sensor failed to start. Halting here so the "
-                       "failure is obvious rather than silently continuing.");
-        return;
-    }
-
-    err = mpu6500_driver_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Movement sensor failed to start. Halting here so the "
-                       "failure is obvious rather than silently continuing.");
-        return;
-    }
-
-    err = eda_driver_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "EDA sensor failed to start. Halting here so the "
-                       "failure is obvious rather than silently continuing.");
-        return;
-    }
-
-    err = vibration_driver_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Vibration motor failed to start. Halting here so the "
-                       "failure is obvious rather than silently continuing.");
-        return;
-    }
-
-    err = rgb_led_driver_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "RGB LED failed to start. Halting here so the "
-                       "failure is obvious rather than silently continuing.");
-        return;
-    }
-
-    err = feature_extraction_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Feature extraction failed to start. Halting here so the "
-                       "failure is obvious rather than silently continuing.");
-        return;
-    }
-
-    err = tflite_inference_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "TFLite inference failed to start. Halting here so the "
-                       "failure is obvious rather than silently continuing.");
-        return;
-    }
-
-    err = ble_gatt_server_init();
+    // BLE now comes up FIRST, immediately after NVS, and before any
+    // sensor. This is deliberately still fatal on failure: if BLE
+    // itself cannot start, there is no remaining channel (short of a
+    // serial cable) through which any later failure could be observed,
+    // so continuing silently would be strictly worse than halting here.
+    esp_err_t err = ble_gatt_server_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "BLE GATT server failed to start. Halting here so the "
                        "failure is obvious rather than silently continuing.");
         return;
     }
+
+    // From this point on, every subsystem failure is non-fatal to
+    // app_main() itself. Each is logged, reported to the app as an
+    // ERROR device state where the locked contract
+    // (ble_gatt_contract_handoff.md) defines a matching error code, and
+    // then execution continues to the next subsystem.
+
+    err = ds18b20_driver_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Temperature sensor failed to start. Continuing without it "
+                       "— BLE stays up and reports ERROR 0x02 (1-Wire failure).");
+        ble_gatt_server_set_error(0x02);  // ERR_ONE_WIRE_FAILURE, per the locked contract
+    } else {
+        s_ds18b20_ok = true;
+        ds18b20_set_upsample_method(TEMP_UPSAMPLE_HOLD_LAST);  // locked, see ds18b20_driver.h
+    }
+
+    err = max30102_driver_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Heart rate sensor failed to start. Continuing without it "
+                       "— BLE stays up and reports ERROR 0x01 (I2C bus failure).");
+        ble_gatt_server_set_error(0x01);  // ERR_I2C_BUS_FAILURE, per the locked contract
+    } else {
+        s_max30102_ok = true;
+    }
+
+    err = mpu6500_driver_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Movement sensor failed to start. Continuing without it "
+                       "— BLE stays up and reports ERROR 0x01 (I2C bus failure, "
+                       "shared bus with the heart rate sensor).");
+        ble_gatt_server_set_error(0x01);  // ERR_I2C_BUS_FAILURE, per the locked contract
+    } else {
+        s_mpu6500_ok = true;
+    }
+
+    err = eda_driver_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "EDA sensor failed to start. Continuing without it "
+                       "— BLE stays up and reports ERROR 0x03 (EDA ADC failure).");
+        ble_gatt_server_set_error(0x03);  // ERR_EDA_ADC_FAILURE, per the locked contract
+    } else {
+        s_eda_ok = true;
+    }
+
+    // NOTE — open item, not silently resolved: ble_gatt_contract_handoff.md's
+    // Error Code Reference table has no code covering a vibration motor
+    // or RGB LED init failure. Both are simple, low-risk digital GPIO
+    // outputs with no shared bus, so a failure here is logged only and
+    // does NOT push the device into the ERROR state — inventing an
+    // unlocked error code (e.g. 0x07/0x08) is a contract change and
+    // should be a deliberate decision, not something this file decides
+    // unilaterally. Neither driver's failure blocks anything downstream
+    // of it either way.
+    err = vibration_driver_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Vibration motor failed to start. Continuing without it. "
+                       "No locked contract error code exists for this — see the "
+                       "note above this block before adding one.");
+    } else {
+        s_motor_ok = true;
+    }
+
+    err = rgb_led_driver_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "RGB LED failed to start. Continuing without it. "
+                       "No locked contract error code exists for this — see the "
+                       "note above this block before adding one.");
+    } else {
+        s_led_ok = true;
+    }
+
+    err = feature_extraction_init();
+    if (err != ESP_OK) {
+        // Also currently uncovered by a locked contract error code,
+        // same caveat as the motor/LED case above — but unlike those
+        // two, this failure is NOT low-risk: without feature extraction
+        // there can be no inference, so this is effectively the whole
+        // monitoring pipeline being unavailable. Worth prioritising a
+        // contract revision for this one specifically.
+        ESP_LOGE(TAG, "Feature extraction failed to start. Continuing without it, "
+                       "but this disables the entire monitoring pipeline for this "
+                       "boot. No locked contract error code exists for this yet.");
+    } else {
+        s_feature_extraction_ok = true;
+    }
+
+    err = tflite_inference_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "TFLite inference failed to start. Continuing without it "
+                       "— BLE stays up and reports ERROR 0x04 (TFLite allocation "
+                       "failure), which the contract already documents as "
+                       "unrecoverable for this boot.");
+        ble_gatt_server_set_error(0x04);  // ERR_TFLITE_ALLOC_FAILURE, per the locked contract
+    } else {
+        s_tflite_ok = true;
+    }
+
+    ESP_LOGI(TAG, "Boot summary — DS18B20:%s MAX30102:%s MPU6500:%s EDA:%s "
+                   "Motor:%s LED:%s FeatureExtraction:%s TFLite:%s. BLE is up "
+                   "regardless of the above and advertising as \"NervGuard\".",
+              s_ds18b20_ok ? "OK" : "FAILED", s_max30102_ok ? "OK" : "FAILED",
+              s_mpu6500_ok ? "OK" : "FAILED", s_eda_ok ? "OK" : "FAILED",
+              s_motor_ok ? "OK" : "FAILED", s_led_ok ? "OK" : "FAILED",
+              s_feature_extraction_ok ? "OK" : "FAILED", s_tflite_ok ? "OK" : "FAILED");
 
     // These were originally plain local variables here. That put over
     // 2KB of buffer space directly on app_main's own small task stack,
@@ -146,17 +235,21 @@ void app_main(void)
 
     while (1) {
         float temp_c = 0.0f;
-        if (ds18b20_get_temp_4hz(&temp_c)) {
-            ESP_LOGI(TAG, "Temp: %.4f C", temp_c);
-        } else {
-            ESP_LOGI(TAG, "Temp: waiting for first real reading...");
+        if (s_ds18b20_ok) {
+            if (ds18b20_get_temp_4hz(&temp_c)) {
+                ESP_LOGI(TAG, "Temp: %.4f C", temp_c);
+            } else {
+                ESP_LOGI(TAG, "Temp: waiting for first real reading...");
+            }
         }
 
         // Drain whatever heart-rate samples have piled up since the last
         // time we checked (the sensor fills these at a steady 100/sec on
         // its own, in hardware, independent of this loop's own timing).
         size_t ir_count = 0;
-        max30102_read_ir_samples(ir_samples, 100, &ir_count);
+        if (s_max30102_ok) {
+            max30102_read_ir_samples(ir_samples, 100, &ir_count);
+        }
         if (ir_count > 0) {
             uint32_t min_val = ir_samples[0];
             uint32_t max_val = ir_samples[0];
@@ -167,7 +260,7 @@ void app_main(void)
             ESP_LOGI(TAG, "Heart rate: %u samples, latest = %lu, range in this batch = %lu (min %lu, max %lu)",
                       (unsigned)ir_count, (unsigned long)ir_samples[ir_count - 1],
                       (unsigned long)(max_val - min_val), (unsigned long)min_val, (unsigned long)max_val);
-        } else {
+        } else if (s_max30102_ok) {
             ESP_LOGI(TAG, "Heart rate: no new samples yet...");
         }
 
@@ -177,7 +270,9 @@ void app_main(void)
         // should push both the average and the swing in magnitude well
         // away from that quiet 1.0g baseline.
         size_t accel_count = 0;
-        mpu6500_read_samples(accel_samples, 150, &accel_count);
+        if (s_mpu6500_ok) {
+            mpu6500_read_samples(accel_samples, 150, &accel_count);
+        }
         if (accel_count > 0) {
             float mag_sum = 0.0f, mag_min = 0.0f, mag_max = 0.0f;
             for (size_t i = 0; i < accel_count; i++) {
@@ -191,7 +286,7 @@ void app_main(void)
             float mag_avg = mag_sum / (float)accel_count;
             ESP_LOGI(TAG, "Movement: %u samples, avg magnitude = %.4f g (min %.4f, max %.4f)",
                       (unsigned)accel_count, mag_avg, mag_min, mag_max);
-        } else {
+        } else if (s_mpu6500_ok) {
             ESP_LOGI(TAG, "Movement: no new samples yet...");
         }
 
@@ -204,7 +299,9 @@ void app_main(void)
         // catching an implausibly fast jump — see eda_driver.c for why
         // that filter exists and real hardware evidence for it.
         size_t eda_count = 0;
-        eda_read_samples(eda_samples, 150, &eda_count);
+        if (s_eda_ok) {
+            eda_read_samples(eda_samples, 150, &eda_count);
+        }
         if (eda_count > 0) {
             eda_sample_t latest = eda_samples[eda_count - 1];
             size_t uncalibrated_count = 0;
@@ -220,7 +317,7 @@ void app_main(void)
                       latest.artifact_rejected ? " (HELD - noise rejected)" : "",
                       (unsigned)uncalibrated_count, (unsigned)eda_count,
                       (unsigned)rejected_count, (unsigned)eda_count);
-        } else {
+        } else if (s_eda_ok) {
             ESP_LOGI(TAG, "EDA: no new samples yet...");
         }
 
@@ -230,14 +327,25 @@ void app_main(void)
         // since it's what feeds fresh sensor data into the 60-second
         // rolling window. It only actually PRODUCES a new 13-number
         // feature vector once every 5 seconds (20 ticks) — most calls
-        // do nothing more than quietly top up the window.
-        feature_extraction_tick();
+        // do nothing more than quietly top up the window. Guarded on
+        // s_feature_extraction_ok: if feature_extraction_init() failed
+        // at boot, ticking it further is undefined and must be skipped
+        // entirely for the rest of this boot.
+        if (s_feature_extraction_ok) {
+            feature_extraction_tick();
+        }
 
-        // Wear detection needs the current temperature every tick,
-        // regardless of whether a new feature window is ready.
-        ble_gatt_server_update_wear_detection(temp_c);
+        // Wear detection needs the current temperature every tick.
+        // Guarded on s_ds18b20_ok: without a working sensor, temp_c
+        // above is never populated (stays 0.0f), and feeding that in
+        // would read as "below the NOT_WORN threshold" and could
+        // spuriously drive a wear-state transition despite carrying no
+        // real information about the device being on the wrist.
+        if (s_ds18b20_ok) {
+            ble_gatt_server_update_wear_detection(temp_c);
+        }
 
-        if (feature_extraction_get_latest(&latest_features)) {
+        if (s_feature_extraction_ok && feature_extraction_get_latest(&latest_features)) {
             window_sequence++;
 
             // Feature order here MUST match feature_extraction.h's
@@ -278,7 +386,7 @@ void app_main(void)
 
             int stress_class = 0;
             float probability = 0.0f;
-            if (tflite_inference_run(feature_array, &stress_class, &probability)) {
+            if (s_tflite_ok && tflite_inference_run(feature_array, &stress_class, &probability)) {
                 ESP_LOGI(TAG, "Inference: class=%d probability=%.4f", stress_class, probability);
                 ble_gatt_server_notify_inference(stress_class, probability, window_sequence);
 
@@ -288,14 +396,18 @@ void app_main(void)
                 // escalation), which stays entirely app-side per
                 // chat2_firmware_handoff.md's locked design. The motor
                 // is deliberately NOT auto-triggered here for the same
-                // reason — see vibration_driver.h.
-                switch (stress_class) {
-                    case 0: rgb_led_set(LED_GREEN);  break;
-                    case 1: rgb_led_set(LED_YELLOW); break;
-                    case 2: rgb_led_set(LED_RED);    break;
-                    default: break;
+                // reason — see vibration_driver.h. Guarded on
+                // s_led_ok since rgb_led_driver_init() may not have
+                // succeeded this boot.
+                if (s_led_ok) {
+                    switch (stress_class) {
+                        case 0: rgb_led_set(LED_GREEN);  break;
+                        case 1: rgb_led_set(LED_YELLOW); break;
+                        case 2: rgb_led_set(LED_RED);    break;
+                        default: break;
+                    }
                 }
-            } else {
+            } else if (s_tflite_ok) {
                 ESP_LOGW(TAG, "Inference failed for this window");
             }
         }
