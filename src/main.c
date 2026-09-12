@@ -4,6 +4,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 
 #include "ds18b20_driver.h"
@@ -218,20 +219,44 @@ void app_main(void)
               s_motor_ok ? "OK" : "FAILED", s_led_ok ? "OK" : "FAILED",
               s_feature_extraction_ok ? "OK" : "FAILED", s_tflite_ok ? "OK" : "FAILED");
 
-    // These were originally plain local variables here. That put over
-    // 2KB of buffer space directly on app_main's own small task stack,
-    // which was fine with two sensors' worth of buffers but overflowed
-    // that stack once the third (larger) movement buffer was added,
-    // causing the reboot loop seen on real hardware. Marking them
-    // static moves them into a separate, much larger area of memory
-    // instead, leaving app_main's own stack untouched.
-    static uint32_t ir_samples[100];
-    static mpu6500_sample_t accel_samples[150];
-    static eda_sample_t eda_samples[150];
+    // ir_samples, accel_samples, and eda_samples used to live here as
+    // static buffers for this function's own direct sensor reads.
+    // REMOVED as part of this revision's fix: main.c no longer reads
+    // any of the three multi-sample sensors directly. feature_extraction.c
+    // is now the sole reader of each, and this function gets everything
+    // it needs for its console lines from the three summary structs
+    // populated there each tick. See feature_extraction.c's doc comment
+    // above s_last_hr_summary for the full history of why this changed.
     static feature_vector_t latest_features;
     static float feature_array[13];
 
     uint8_t window_sequence = 0;
+
+    // --- Periodic results-table checkpoint (added for stress-induction
+    // test logging) ---
+    //
+    // WHY THIS EXISTS: the per-tick sensor lines and per-window feature
+    // lines are useful for debugging but far too dense to manually
+    // extract a results table from, especially for a multi-minute test
+    // where the terminal's scrollback may not even retain the whole
+    // session. This adds ONE compact, consistently-formatted line every
+    // 5 minutes of device uptime, tagged [RESULT-LOG] so it can be
+    // grepped out of a full log even if everything else got mixed
+    // together or partially lost. Each line is self-contained (carries
+    // its own elapsed-time stamp), so losing earlier scrollback does not
+    // make a later line unusable — unlike the per-tick lines, which only
+    // make sense with surrounding context.
+    //
+    // stress_class and probability are captured here into STATIC
+    // "last known" variables specifically because, in the loop body
+    // below, they are otherwise only ever local to the single iteration
+    // that produced a fresh window — they do not normally persist until
+    // the next 5-minute checkpoint fires, which will usually land
+    // between windows (windows arrive every 5s; checkpoints every 5min).
+    static int s_last_stress_class = 0;
+    static float s_last_probability = 0.0f;
+    static int64_t s_last_checkpoint_us = 0;
+    #define RESULT_LOG_INTERVAL_US (5LL * 60LL * 1000000LL)  // 5 minutes
 
     while (1) {
         float temp_c = 0.0f;
@@ -241,84 +266,6 @@ void app_main(void)
             } else {
                 ESP_LOGI(TAG, "Temp: waiting for first real reading...");
             }
-        }
-
-        // Drain whatever heart-rate samples have piled up since the last
-        // time we checked (the sensor fills these at a steady 100/sec on
-        // its own, in hardware, independent of this loop's own timing).
-        size_t ir_count = 0;
-        if (s_max30102_ok) {
-            max30102_read_ir_samples(ir_samples, 100, &ir_count);
-        }
-        if (ir_count > 0) {
-            uint32_t min_val = ir_samples[0];
-            uint32_t max_val = ir_samples[0];
-            for (size_t i = 1; i < ir_count; i++) {
-                if (ir_samples[i] < min_val) min_val = ir_samples[i];
-                if (ir_samples[i] > max_val) max_val = ir_samples[i];
-            }
-            ESP_LOGI(TAG, "Heart rate: %u samples, latest = %lu, range in this batch = %lu (min %lu, max %lu)",
-                      (unsigned)ir_count, (unsigned long)ir_samples[ir_count - 1],
-                      (unsigned long)(max_val - min_val), (unsigned long)min_val, (unsigned long)max_val);
-        } else if (s_max30102_ok) {
-            ESP_LOGI(TAG, "Heart rate: no new samples yet...");
-        }
-
-        // Same drain-and-summarise approach for movement. A stationary
-        // device should show a magnitude very close to 1.0g (gravity)
-        // with almost no variation. Picking the device up and moving it
-        // should push both the average and the swing in magnitude well
-        // away from that quiet 1.0g baseline.
-        size_t accel_count = 0;
-        if (s_mpu6500_ok) {
-            mpu6500_read_samples(accel_samples, 150, &accel_count);
-        }
-        if (accel_count > 0) {
-            float mag_sum = 0.0f, mag_min = 0.0f, mag_max = 0.0f;
-            for (size_t i = 0; i < accel_count; i++) {
-                mpu6500_sample_t s = accel_samples[i];
-                float mag = sqrtf(s.x_g * s.x_g + s.y_g * s.y_g + s.z_g * s.z_g);
-                if (i == 0) { mag_min = mag; mag_max = mag; }
-                if (mag < mag_min) mag_min = mag;
-                if (mag > mag_max) mag_max = mag;
-                mag_sum += mag;
-            }
-            float mag_avg = mag_sum / (float)accel_count;
-            ESP_LOGI(TAG, "Movement: %u samples, avg magnitude = %.4f g (min %.4f, max %.4f)",
-                      (unsigned)accel_count, mag_avg, mag_min, mag_max);
-        } else if (s_mpu6500_ok) {
-            ESP_LOGI(TAG, "Movement: no new samples yet...");
-        }
-
-        // Same drain-and-summarise approach for skin conductance. Two
-        // counts matter here: "outside calibrated range" tells us how
-        // often real readings are landing beyond the three actually-
-        // measured calibration points (see eda_driver.h) — a high count
-        // is a sign the table genuinely needs those extra 50kΩ/220kΩ
-        // points. "rejected as noise" tells us how often the filter is
-        // catching an implausibly fast jump — see eda_driver.c for why
-        // that filter exists and real hardware evidence for it.
-        size_t eda_count = 0;
-        if (s_eda_ok) {
-            eda_read_samples(eda_samples, 150, &eda_count);
-        }
-        if (eda_count > 0) {
-            eda_sample_t latest = eda_samples[eda_count - 1];
-            size_t uncalibrated_count = 0;
-            size_t rejected_count = 0;
-            for (size_t i = 0; i < eda_count; i++) {
-                if (!eda_samples[i].calibrated) uncalibrated_count++;
-                if (eda_samples[i].artifact_rejected) rejected_count++;
-            }
-            ESP_LOGI(TAG, "EDA: %u samples, latest = %.4fV -> %.0f ohms -> %.3f uS%s%s, "
-                           "%u/%u outside calibrated range, %u/%u rejected as noise",
-                      (unsigned)eda_count, latest.voltage, latest.resistance_ohms, latest.conductance_us,
-                      latest.calibrated ? "" : " (EXTRAPOLATED)",
-                      latest.artifact_rejected ? " (HELD - noise rejected)" : "",
-                      (unsigned)uncalibrated_count, (unsigned)eda_count,
-                      (unsigned)rejected_count, (unsigned)eda_count);
-        } else if (s_eda_ok) {
-            ESP_LOGI(TAG, "EDA: no new samples yet...");
         }
 
         // --- Full pipeline: feature extraction -> inference -> BLE ---
@@ -331,8 +278,77 @@ void app_main(void)
         // s_feature_extraction_ok: if feature_extraction_init() failed
         // at boot, ticking it further is undefined and must be skipped
         // entirely for the rest of this boot.
+        //
+        // ORDERING FIX: this must run BEFORE the three console-summary
+        // blocks below can show THIS tick's data. feature_extraction_tick()
+        // is what actually performs the heart-rate/movement/EDA reads
+        // and populates the summaries those blocks display; it used to
+        // run AFTER this main.c file's own direct sensor reads for those
+        // same three console lines, which is what caused this session's
+        // starvation bug — see feature_extraction.c's doc comment above
+        // s_last_hr_summary for the full history.
         if (s_feature_extraction_ok) {
             feature_extraction_tick();
+        }
+
+        // Heart-rate console line now comes from feature_extraction's
+        // own summary of the ONE read it performs each tick, rather
+        // than a second, separate call to max30102_read_ir_samples()
+        // from here. FIX: both calls used to draw from the same
+        // consuming ring buffer, and whichever ran first — this one,
+        // since it used to run before feature_extraction_tick() below
+        // — took most of the tick's samples, leaving
+        // feed_heart_rate() starved (confirmed directly via
+        // [HRV-DIAG-BATCH] logging: ~2 samples reaching it on ticks
+        // this line reported 24-30 for). See feature_extraction.c's
+        // doc comment above s_last_hr_summary for the full history.
+        // This line now only reads a summary struct, not the sensor.
+        hr_batch_summary_t hr_summary = {0};
+        bool have_hr_batch = feature_extraction_get_last_hr_batch(&hr_summary);
+        if (have_hr_batch) {
+            ESP_LOGI(TAG, "Heart rate: %u samples, latest = %lu, range in this batch = %lu (min %lu, max %lu)",
+                      (unsigned)hr_summary.count, (unsigned long)hr_summary.latest,
+                      (unsigned long)(hr_summary.max - hr_summary.min),
+                      (unsigned long)hr_summary.min, (unsigned long)hr_summary.max);
+        } else if (s_max30102_ok) {
+            ESP_LOGI(TAG, "Heart rate: no new samples yet...");
+        }
+
+        // Movement console line, same fix, same reasoning: this used to
+        // call mpu6500_read_samples() directly, a second, separate read
+        // of the same consuming ring buffer feed_accel() also reads
+        // from inside feature_extraction_tick(). Now reads the summary
+        // feature_extraction.c already computed from its own single
+        // authoritative read.
+        accel_batch_summary_t accel_summary = {0};
+        bool have_accel_batch = feature_extraction_get_last_accel_batch(&accel_summary);
+        if (have_accel_batch) {
+            ESP_LOGI(TAG, "Movement: %u samples, avg magnitude = %.4f g (min %.4f, max %.4f)",
+                      (unsigned)accel_summary.count, accel_summary.avg_magnitude_g,
+                      accel_summary.min_magnitude_g, accel_summary.max_magnitude_g);
+        } else if (s_mpu6500_ok) {
+            ESP_LOGI(TAG, "Movement: no new samples yet...");
+        }
+
+        // EDA console line, same fix, same reasoning: this used to call
+        // eda_read_samples() directly, a second, separate read of the
+        // same consuming ring buffer feed_eda() also reads from inside
+        // feature_extraction_tick(). Now reads the summary
+        // feature_extraction.c already computed from its own single
+        // authoritative read.
+        eda_batch_summary_t eda_summary = {0};
+        bool have_eda_batch = feature_extraction_get_last_eda_batch(&eda_summary);
+        if (have_eda_batch) {
+            ESP_LOGI(TAG, "EDA: %u samples, latest = %.4fV -> %.0f ohms -> %.3f uS%s%s, "
+                           "%u/%u outside calibrated range, %u/%u rejected as noise",
+                      (unsigned)eda_summary.count, eda_summary.latest_voltage,
+                      eda_summary.latest_resistance_ohms, eda_summary.latest_conductance_us,
+                      eda_summary.latest_calibrated ? "" : " (EXTRAPOLATED)",
+                      eda_summary.latest_artifact_rejected ? " (HELD - noise rejected)" : "",
+                      (unsigned)eda_summary.uncalibrated_count, (unsigned)eda_summary.count,
+                      (unsigned)eda_summary.rejected_count, (unsigned)eda_summary.count);
+        } else if (s_eda_ok) {
+            ESP_LOGI(TAG, "EDA: no new samples yet...");
         }
 
         // Wear detection needs the current temperature every tick.
@@ -390,6 +406,12 @@ void app_main(void)
                 ESP_LOGI(TAG, "Inference: class=%d probability=%.4f", stress_class, probability);
                 ble_gatt_server_notify_inference(stress_class, probability, window_sequence);
 
+                // Feeds the periodic [RESULT-LOG] checkpoint below —
+                // see the doc comment above s_last_stress_class's
+                // declaration for why this capture is needed here.
+                s_last_stress_class = stress_class;
+                s_last_probability = probability;
+
                 // Simple visual status indicator only — this is
                 // separate from, and does not drive, the app's own
                 // intervention logic (mild/intensive pools, cooldowns,
@@ -410,6 +432,35 @@ void app_main(void)
             } else if (s_tflite_ok) {
                 ESP_LOGW(TAG, "Inference failed for this window");
             }
+        }
+
+        // --- Periodic results-table checkpoint ---
+        // See the doc comment above s_last_stress_class's declaration.
+        // Fires once every 5 minutes of device uptime, independent of
+        // the 5-second window/inference cadence above. One self-
+        // contained, grep-able line: [RESULT-LOG] elapsed=HH:MM:SS
+        // followed by the most recent value of every field a results
+        // table needs. Elapsed time is derived from esp_timer_get_time()
+        // (microseconds since boot), not a loop-iteration count, so it
+        // stays accurate to real wall-clock time regardless of any
+        // single iteration running slightly longer than 250ms.
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - s_last_checkpoint_us >= RESULT_LOG_INTERVAL_US) {
+            s_last_checkpoint_us = now_us;
+            int64_t elapsed_s = now_us / 1000000LL;
+            int hh = (int)(elapsed_s / 3600);
+            int mm = (int)((elapsed_s % 3600) / 60);
+            int ss = (int)(elapsed_s % 60);
+            ESP_LOGI(TAG, "[RESULT-LOG] elapsed=%02d:%02d:%02d seq=%u class=%d prob=%.4f "
+                           "eda_uS=%.3f hrv_rmssd_ms=%.1f hrv_mean_rr_ms=%.1f hrv_sdnn_ms=%.1f hrv_sd2_ms=%.1f "
+                           "temp_C=%.3f acc_mag_mean_g=%.3f acc_mag_std_g=%.3f acc_activity=%.0f",
+                      hh, mm, ss, window_sequence, s_last_stress_class, s_last_probability,
+                      latest_features.eda_mean,
+                      latest_features.hrv_rmssd, latest_features.hrv_mean_rr,
+                      latest_features.hrv_sdnn, latest_features.hrv_sd2,
+                      latest_features.temp_mean,
+                      latest_features.acc_mag_mean, latest_features.acc_mag_std,
+                      latest_features.acc_activity);
         }
 
         // 250ms = four times a second. This is the cadence feature
